@@ -7,97 +7,176 @@ from torchvision import transforms
 from torchvision import models
 
 from torch.utils.data import DataLoader
-from torch.utils.data import random_split
 
-# -------------------------
+# =====================================
 # Device
-# -------------------------
+# =====================================
 
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-print("Using:", device)
+print(f"\nUsing Device: {device}")
 
-# -------------------------
-# Transform
-# -------------------------
+# =====================================
+# Dataset Paths
+# =====================================
 
-transform = transforms.Compose([
-    transforms.Resize((224,224)),
-    transforms.ToTensor()
+TRAIN_DIR = "../../../datasets/image/train"
+VAL_DIR = "../../../datasets/image/val"
+TEST_DIR = "../../../datasets/image/test"
+
+# =====================================
+# Image Transforms
+# =====================================
+
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ColorJitter(
+        brightness=0.2,
+        contrast=0.2,
+        saturation=0.2
+    ),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
 ])
 
-# -------------------------
-# Dataset
-# -------------------------
+test_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
+])
 
-dataset = datasets.ImageFolder(
-    "../../../datasets/image",
-    transform=transform
+# =====================================
+# Load Datasets
+# =====================================
+
+train_dataset = datasets.ImageFolder(
+    TRAIN_DIR,
+    transform=train_transform
 )
 
-# -------------------------
-# Split Dataset
-# -------------------------
-
-train_size = int(0.8 * len(dataset))
-test_size = len(dataset) - train_size
-
-train_dataset, test_dataset = random_split(
-    dataset,
-    [train_size, test_size]
+val_dataset = datasets.ImageFolder(
+    VAL_DIR,
+    transform=test_transform
 )
+
+test_dataset = datasets.ImageFolder(
+    TEST_DIR,
+    transform=test_transform
+)
+
+print("\nClass Mapping:")
+print(train_dataset.class_to_idx)
+
+print(f"\nTrain Images : {len(train_dataset)}")
+print(f"Validation Images : {len(val_dataset)}")
+print(f"Test Images : {len(test_dataset)}")
+
+# =====================================
+# Data Loaders
+# =====================================
 
 train_loader = DataLoader(
     train_dataset,
     batch_size=32,
-    shuffle=True
+    shuffle=True,
+    num_workers=0,
+    pin_memory=True
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=32,
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True
 )
 
 test_loader = DataLoader(
     test_dataset,
     batch_size=32,
-    shuffle=False
+    shuffle=False,
+    num_workers=0,
+    pin_memory=True
 )
 
-# -------------------------
+# =====================================
 # Model
-# -------------------------
+# =====================================
 
-model = models.resnet18(weights="DEFAULT")
+model = models.efficientnet_b0(
+    weights=models.EfficientNet_B0_Weights.DEFAULT
+)
 
-num_features = model.fc.in_features
+num_features = model.classifier[1].in_features
 
-model.fc = nn.Linear(
+model.classifier[1] = nn.Linear(
     num_features,
     2
 )
 
 model = model.to(device)
+torch.backends.cudnn.benchmark = True
 
-# -------------------------
-# Loss & Optimizer
-# -------------------------
+# =====================================
+# Loss Function
+# =====================================
 
 criterion = nn.CrossEntropyLoss()
 
-optimizer = optim.Adam(
+# =====================================
+# Optimizer
+# =====================================
+
+optimizer = optim.AdamW(
     model.parameters(),
-    lr=0.001
+    lr=1e-4,
+    weight_decay=1e-4
 )
 
-# -------------------------
-# Training
-# -------------------------
+# =====================================
+# Scheduler
+# =====================================
 
-epochs = 20
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="max",
+    factor=0.5,
+    patience=2
+)
+
+# =====================================
+# Training Settings
+# =====================================
+
+epochs = 30
+
+best_acc = 0.0
+
+early_stop_patience = 5
+counter = 0
+
+# =====================================
+# Training Loop
+# =====================================
 
 for epoch in range(epochs):
 
     model.train()
 
-    running_loss = 0
+    running_loss = 0.0
+
+    train_correct = 0
+    train_total = 0
 
     for images, labels in train_loader:
 
@@ -107,6 +186,12 @@ for epoch in range(epochs):
         optimizer.zero_grad()
 
         outputs = model(images)
+
+        _, predicted = torch.max(outputs, 1)
+
+        train_total += labels.size(0)
+        train_correct += (predicted == labels).sum().item()
+
 
         loss = criterion(
             outputs,
@@ -119,18 +204,127 @@ for epoch in range(epochs):
 
         running_loss += loss.item()
 
+    # =====================================
+    # Validation
+    # =====================================
+    train_acc = 100 * train_correct / train_total
+    model.eval()
+
+    correct = 0
+    total = 0
+
+    with torch.no_grad():
+
+        for images, labels in val_loader:
+
+            images = images.to(device)
+            labels = labels.to(device)
+
+            outputs = model(images)
+
+            _, predicted = torch.max(
+                outputs,
+                1
+            )
+
+            total += labels.size(0)
+
+            correct += (
+                predicted == labels
+            ).sum().item()
+
+    val_acc = 100 * correct / total
+
+    scheduler.step(val_acc)
+
     print(
-        f"Epoch [{epoch+1}/{epochs}] "
-        f"Loss: {running_loss:.4f}"
+        f"Epoch [{epoch+1}/{epochs}] | "
+        f"Loss: {running_loss:.4f} | "
+        f"Train Acc: {train_acc:.2f}% | "
+        f"Val Acc: {val_acc:.2f}%"
     )
 
-# -------------------------
-# Save Model
-# -------------------------
+    # =====================================
+    # Save Best Model
+    # =====================================
 
-torch.save(
-    model.state_dict(),
-    "../../models/image/deepfake_image.pth"
+    if val_acc > best_acc:
+
+        best_acc = val_acc
+        counter = 0
+
+        torch.save(
+            model.state_dict(),
+            "../../models/image/best_model_v2.pth"
+        )
+
+        print(
+            f"Best Model Saved ({best_acc:.2f}%)"
+        )
+
+    else:
+
+        counter += 1
+
+        if counter >= early_stop_patience:
+
+            print(
+                f"\nEarly Stopping at Epoch {epoch+1}"
+            )
+
+            break
+
+# =====================================
+# Load Best Model
+# =====================================
+
+print(
+    f"\nLoading Best Model ({best_acc:.2f}%)"
 )
 
-print("Model Saved Successfully!")
+model.load_state_dict(
+    torch.load(
+        "../../models/image/best_model_v2.pth",
+        map_location=device
+    )
+)
+
+# =====================================
+# Test Evaluation
+# =====================================
+
+model.eval()
+
+correct = 0
+total = 0
+
+with torch.no_grad():
+
+    for images, labels in test_loader:
+
+        images = images.to(device)
+        labels = labels.to(device)
+
+        outputs = model(images)
+
+        _, predicted = torch.max(
+            outputs,
+            1
+        )
+
+        total += labels.size(0)
+
+        correct += (
+            predicted == labels
+        ).sum().item()
+
+test_acc = 100 * correct / total
+
+print(
+    f"\nFinal Test Accuracy: {test_acc:.2f}%"
+)
+
+print(
+    "\nBest Model Saved At:\n"
+    "../../models/image/best_model_v2.pth"
+)
