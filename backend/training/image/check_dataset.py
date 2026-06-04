@@ -1,23 +1,18 @@
-from PIL import Image
-import os
+from torchvision import datasets
 
-dataset_path = "../../../datasets/image"
+val_dataset = datasets.ImageFolder(
+    "../../../datasets/image/val"
+)
 
-count = 0
+fake = 0
+real = 0
 
-for root, dirs, files in os.walk(dataset_path):
-    for file in files:
-        path = os.path.join(root, file)
+for _, label in val_dataset.samples:
+    if label == 0:
+        fake += 1
+    else:
+        real += 1
 
-        try:
-            img = Image.open(path)
-            img.load()
-
-            count += 1
-
-        except Exception as e:
-            print("BAD:", path)
-            print(e)
-            break
-
-print("Valid Images:", count)
+print("Fake:", fake)
+print("Real:", real)
+print("Total:", fake + real)

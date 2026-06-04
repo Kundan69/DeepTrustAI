@@ -1,31 +1,25 @@
+import os
 import torch
 import torch.nn as nn
-import os
 
-from torchvision import models, transforms
-from PIL import Image, ImageFile
+from torchvision import models
+from torchvision import transforms
 
-# -------------------------------------------------
-# Safe image loading (handles slightly corrupted images)
-# -------------------------------------------------
-ImageFile.LOAD_TRUNCATED_IMAGES = True
+from PIL import Image
 
-# -------------------------------------------------
-# Device (CPU for now)
-# -------------------------------------------------
-device = torch.device("cpu")
+# =====================================
+# Device
+# =====================================
 
-# -------------------------------------------------
-# Model Setup (ResNet18)
-# -------------------------------------------------
-model = models.resnet18(weights=None)
+device = torch.device(
+    "cuda" if torch.cuda.is_available()
+    else "cpu"
+)
 
-num_features = model.fc.in_features
-model.fc = nn.Linear(num_features, 2)
+# =====================================
+# Model Path
+# =====================================
 
-# -------------------------------------------------
-# Dynamic model path (NO HARD CODE)
-# -------------------------------------------------
 BASE_DIR = os.path.dirname(__file__)
 
 MODEL_PATH = os.path.join(
@@ -33,80 +27,161 @@ MODEL_PATH = os.path.join(
     "..",
     "models",
     "image",
-    "deepfake_image.pth"
+    "best_model_v2.pth"
 )
 
-# -------------------------------------------------
-# Load trained weights
-# -------------------------------------------------
+print(MODEL_PATH)
+
+# =====================================
+# Model Architecture
+# MUST MATCH TRAINING
+# =====================================
+
+model = models.efficientnet_b0(
+    weights=None
+)
+
+num_features = model.classifier[1].in_features
+
+model.classifier[1] = nn.Linear(
+    num_features,
+    2
+)
+
+# =====================================
+# Load Weights
+# =====================================
+
 model.load_state_dict(
-    torch.load(MODEL_PATH, map_location=device)
+    torch.load(
+        MODEL_PATH,
+        map_location=device
+    )
 )
 
 model.to(device)
 model.eval()
 
-# -------------------------------------------------
-# Image Transform
-# -------------------------------------------------
+# =====================================
+# Transform
+# SAME AS TRAINING
+# =====================================
+
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
     )
 ])
 
-# -------------------------------------------------
-# Classes
-# -------------------------------------------------
-classes = ["fake", "real"]
+# =====================================
+# Class Mapping
+# =====================================
 
-# -------------------------------------------------
+classes = {
+    0: "FAKE",
+    1: "REAL"
+}
+
+# =====================================
 # Prediction Function
-# -------------------------------------------------
-def predict_image(image_path: str):
+# =====================================
+
+def predict_image(image_path):
 
     try:
-        image = Image.open(image_path).convert("RGB")
-    except Exception as e:
+
+        image = Image.open(
+            image_path
+        ).convert("RGB")
+
+        image = transform(image)
+
+        image = image.unsqueeze(0)
+
+        image = image.to(device)
+
+        with torch.no_grad():
+
+            outputs = model(image)
+
+            probabilities = torch.softmax(
+                outputs,
+                dim=1
+            )
+
+            print("\nRaw Output:")
+            print(outputs)
+
+            print("\nProbabilities:")
+            print(probabilities)
+
+            confidence, prediction = torch.max(
+                probabilities,
+                1
+            )
+
+            fake_probability = (
+                probabilities[0][0].item()
+                * 100
+            )
+
+            real_probability = (
+                probabilities[0][1].item()
+                * 100
+            )
+
+            print(
+                f"\nPrediction: {classes[prediction.item()]}"
+            )
+
+            print(
+                f"Fake: {fake_probability:.2f}% | "
+                f"Real: {real_probability:.2f}%"
+            )
+
         return {
-            "error": "Invalid image file",
-            "details": str(e)
+
+            "prediction":
+                classes[prediction.item()],
+
+            "confidence":
+                round(
+                    confidence.item() * 100,
+                    2
+                ),
+
+            "fake_probability":
+                round(
+                    fake_probability,
+                    2
+                ),
+
+            "real_probability":
+                round(
+                    real_probability,
+                    2
+                )
         }
 
-    image = transform(image)
-    image = image.unsqueeze(0).to(device)
+    except Exception as e:
 
-    with torch.no_grad():
-        output = model(image)
+        return {
+            "error": str(e)
+        }
 
-        probabilities = torch.softmax(output, dim=1)
+# =====================================
+# Manual Test
+# =====================================
 
-        confidence, predicted = torch.max(probabilities, 1)
-
-    return {
-        "prediction": classes[predicted.item()],
-        "confidence": round(confidence.item() * 100, 2)
-    }
-
-
-# -------------------------------------------------
-# Manual Test (optional)
-# -------------------------------------------------
 if __name__ == "__main__":
 
-    test_path = os.path.join(
-        BASE_DIR,
-        "..",
-        "..",
-        "datasets",
-        "image",
-        "fake",
-        "easy_80_0001.jpg"
-    )
+    test_image = "sample.jpg"
 
-    result = predict_image(test_path)
+    result = predict_image(
+        test_image
+    )
 
     print(result)
