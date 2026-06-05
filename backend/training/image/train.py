@@ -1,3 +1,10 @@
+import json
+import random
+import argparse
+import os
+from io import BytesIO
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,6 +14,7 @@ from torchvision import transforms
 from torchvision import models
 
 from torch.utils.data import DataLoader
+from PIL import Image
 
 # =====================================
 # Device
@@ -18,26 +26,131 @@ device = torch.device(
 
 print(f"\nUsing Device: {device}")
 
+parser = argparse.ArgumentParser(
+    description="Train the image deepfake detector."
+)
+parser.add_argument(
+    "--data-dir",
+    default=os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "..",
+            "datasets",
+            "image"
+        )
+    ),
+    help="Dataset folder containing train, val, and test subfolders."
+)
+
+args = parser.parse_args()
+
 # =====================================
 # Dataset Paths
 # =====================================
 
-TRAIN_DIR = "../../../datasets/image/train"
-VAL_DIR = "../../../datasets/image/val"
-TEST_DIR = "../../../datasets/image/test"
+DATA_DIR = os.path.abspath(args.data_dir)
+TRAIN_DIR = os.path.join(DATA_DIR, "train")
+VAL_DIR = os.path.join(DATA_DIR, "val")
+TEST_DIR = os.path.join(DATA_DIR, "test")
+
+for dataset_path in [TRAIN_DIR, VAL_DIR, TEST_DIR]:
+    if not os.path.isdir(dataset_path):
+        raise FileNotFoundError(
+            f"Missing dataset folder: {dataset_path}\n"
+            "Expected structure: data-dir/train, data-dir/val, data-dir/test "
+            "with fake and real folders inside each."
+        )
 
 # =====================================
 # Image Transforms
 # =====================================
 
+
+class RandomJpegCompression:
+    def __init__(self, quality_range=(35, 95), p=0.5):
+        self.quality_range = quality_range
+        self.p = p
+
+    def __call__(self, image):
+        if random.random() > self.p:
+            return image
+
+        quality = random.randint(*self.quality_range)
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", quality=quality)
+        buffer.seek(0)
+
+        return Image.open(buffer).convert("RGB")
+
+
+class FaceCrop:
+    def __init__(self, padding_ratio=0.25):
+        self.padding_ratio = padding_ratio
+        self.detector = cv2.CascadeClassifier(
+            cv2.data.haarcascades +
+            "haarcascade_frontalface_default.xml"
+        )
+
+    def __call__(self, image):
+        image = image.convert("RGB")
+        image_array = cv2.cvtColor(
+            np.array(image),
+            cv2.COLOR_RGB2BGR
+        )
+
+        gray = cv2.cvtColor(
+            image_array,
+            cv2.COLOR_BGR2GRAY
+        )
+
+        faces = self.detector.detectMultiScale(
+            gray,
+            scaleFactor=1.1,
+            minNeighbors=5,
+            minSize=(50, 50)
+        )
+
+        if len(faces) == 0:
+            return image
+
+        x, y, w, h = max(
+            faces,
+            key=lambda face: face[2] * face[3]
+        )
+
+        padding = int(self.padding_ratio * max(w, h))
+        left = max(x - padding, 0)
+        top = max(y - padding, 0)
+        right = min(x + w + padding, image.width)
+        bottom = min(y + h + padding, image.height)
+
+        return image.crop((left, top, right, bottom))
+
+
 train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    FaceCrop(),
+    transforms.RandomResizedCrop(
+        224,
+        scale=(0.75, 1.0),
+        ratio=(0.9, 1.1)
+    ),
     transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
+    transforms.RandomRotation(8),
     transforms.ColorJitter(
-        brightness=0.2,
-        contrast=0.2,
-        saturation=0.2
+        brightness=0.25,
+        contrast=0.25,
+        saturation=0.2,
+        hue=0.02
+    ),
+    transforms.RandomApply(
+        [transforms.GaussianBlur(kernel_size=3)],
+        p=0.2
+    ),
+    RandomJpegCompression(
+        quality_range=(35, 95),
+        p=0.45
     ),
     transforms.ToTensor(),
     transforms.Normalize(
@@ -47,6 +160,7 @@ train_transform = transforms.Compose([
 ])
 
 test_transform = transforms.Compose([
+    FaceCrop(),
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(
@@ -76,6 +190,11 @@ test_dataset = datasets.ImageFolder(
 
 print("\nClass Mapping:")
 print(train_dataset.class_to_idx)
+
+idx_to_class = {
+    index: class_name
+    for class_name, index in train_dataset.class_to_idx.items()
+}
 
 print(f"\nTrain Images : {len(train_dataset)}")
 print(f"Validation Images : {len(val_dataset)}")
@@ -164,6 +283,9 @@ best_acc = 0.0
 
 early_stop_patience = 5
 counter = 0
+
+MODEL_SAVE_PATH = "../../models/image/best_model_v2.pth"
+METADATA_SAVE_PATH = "../../models/image/best_model_v2.metadata.json"
 
 # =====================================
 # Training Loop
@@ -255,8 +377,22 @@ for epoch in range(epochs):
 
         torch.save(
             model.state_dict(),
-            "../../models/image/best_model_v2.pth"
+            MODEL_SAVE_PATH
         )
+
+        with open(METADATA_SAVE_PATH, "w", encoding="utf-8") as metadata_file:
+            json.dump(
+                {
+                    "class_to_idx": train_dataset.class_to_idx,
+                    "idx_to_class": idx_to_class,
+                    "architecture": "efficientnet_b0",
+                    "image_size": 224,
+                    "preprocessing": "largest_face_crop_with_full_image_fallback",
+                    "best_validation_accuracy": round(best_acc, 4)
+                },
+                metadata_file,
+                indent=2
+            )
 
         print(
             f"Best Model Saved ({best_acc:.2f}%)"
@@ -284,7 +420,7 @@ print(
 
 model.load_state_dict(
     torch.load(
-        "../../models/image/best_model_v2.pth",
+        MODEL_SAVE_PATH,
         map_location=device
     )
 )
@@ -325,6 +461,6 @@ print(
 )
 
 print(
-    "\nBest Model Saved At:\n"
-    "../../models/image/best_model_v2.pth"
+    "\nBest Model Saved At:\n",
+    MODEL_SAVE_PATH
 )
